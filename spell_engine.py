@@ -36,6 +36,36 @@ class SpellSequenceEngine:
                 "effect": "ICE",
                 "description": "Unleash an ice blast!",
             },
+                        "SHADOW CLONE": {
+                            "sequence": ["DOUBLE PEACE"],
+                            "effect": "CLONE",
+                            "description": "Summon shadow clones!",
+                        },
+                        "KAMEHAMEHA": {
+                            "sequence": ["DOUBLE FIST", "DOUBLE PALM"],
+                            "effect": "BEAM",
+                            "description": "Fire an energy wave!",
+                        },
+                        "MANDALA SHIELD": {
+                            "sequence": ["FOUR FINGERS", "OPEN PALM"],
+                            "effect": "SHIELD",
+                            "description": "Conjure a magic circle!",
+                        },
+                        "WEB SHOT": {
+                            "sequence": ["LOVE SIGN", "GUN SIGN"],
+                            "effect": "WEB",
+                            "description": "Shoot a web!",
+                        },
+                        "HEALING AURA": {
+                            "sequence": ["THREE FINGERS", "OPEN PALM"],
+                            "effect": "HEAL",
+                            "description": "Bathe in golden light!",
+                        },
+                        "RASENGAN": {
+                "sequence": ["PEACE SIGN", "FIST", "OPEN PALM"],
+                "effect": "RASENGAN",
+                "description": "Hold a spinning chakra sphere in your palm!",
+            },
         }
 
         self.progress = {

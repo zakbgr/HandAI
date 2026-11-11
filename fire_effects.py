@@ -176,7 +176,10 @@ class FireParticleEngine:
     # --------------------------------------------------
 
     def draw(self, frame):
-
+       
+        if not self.particles:
+            return frame
+        
         height, width = frame.shape[:2]
 
         glow = frame.copy()

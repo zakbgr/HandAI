@@ -12,6 +12,18 @@ from finger_detection import GestureRecognizer
 from spell_engine import SpellSequenceEngine
 from fire_effects import FireParticleEngine
 from face_tracking import FaceTracker
+from rasengan_effects import RasenganEffect
+from lightning_effects import LightningEffect
+from ice_effects import IceBlastEffect
+from more_effects import (
+    DOUBLE_GESTURES,
+    ShadowCloneEffect,
+    KamehamehaEffect,
+    MandalaShieldEffect,
+    WebShotEffect,
+    HealingAuraEffect,
+    two_hand_pose,
+)
 
 
 # ==========================================================
@@ -108,6 +120,7 @@ class HandTracker:
         hands = result.hand_landmarks
 
         current_gesture = "NO HAND"
+        gestures = []
 
         for hand_index, landmarks in enumerate(hands):
 
@@ -129,6 +142,7 @@ class HandTracker:
                 landmarks,
                 hand_label
             )
+            gestures.append(gesture)
             if hand_index == 0:
                 current_gesture = gesture
 
@@ -186,7 +200,7 @@ class HandTracker:
             # DISPLAY GESTURE
             # --------------------------------------------------
 
-            y_offset = 80 + hand_index * 90
+            y_offset = 120 + hand_index * 90
 
             cv2.putText(
                 frame,
@@ -217,6 +231,13 @@ class HandTracker:
                 (255, 255, 255),
                 2
             )
+
+        # Two-handed signs: both hands making the same gesture.
+        if len(gestures) == 2 and gestures[0] == gestures[1]:
+            double = DOUBLE_GESTURES.get(gestures[0])
+
+            if double:
+                current_gesture = double
 
         return frame , current_gesture
 
@@ -464,19 +485,23 @@ class HandAIApp:
         face_tracker = None
 
         try:
-            # Initialize existing hand tracker.
             tracker = HandTracker()
 
-            # Initialize face tracking.
             face_tracker = FaceTracker(
                 str(PROJECT_DIR / "models" / "face_landmarker.task")
             )
 
-            # Initialize magic engines.
             spell_engine = SpellSequenceEngine()
             fire = FireParticleEngine()
+            rasengan = RasenganEffect()
+            lightning = LightningEffect()
+            ice = IceBlastEffect()
+            clone = ShadowCloneEffect()
+            kame = KamehamehaEffect()
+            shield = MandalaShieldEffect()
+            web = WebShotEffect()
+            heal = HealingAuraEffect()
 
-            # Initialize webcam.
             camera = cv2.VideoCapture(
                 CAMERA_INDEX,
                 cv2.CAP_V4L2
@@ -498,6 +523,10 @@ class HandAIApp:
 
             fire_until = 0.0
 
+            # Rasengan dismissal timers.
+            fist_since = None
+            hand_lost_since = None
+
             while not self.stop_event.is_set():
 
                 success, frame = camera.read()
@@ -506,10 +535,8 @@ class HandAIApp:
                     time.sleep(0.01)
                     continue
 
-                # Mirror webcam image.
                 frame = cv2.flip(frame, 1)
 
-                # Calculate effect frame time.
                 current_time = time.perf_counter()
 
                 effect_dt = min(
@@ -520,19 +547,28 @@ class HandAIApp:
                 effect_previous_time = current_time
 
                 face_data = None
+                palm = None
+                index_tip = None
+                pose = None
                 gesture = "NO HAND"
 
                 if self.pause_event.is_set():
 
                     hands_count = 0
                     status = "Detection paused"
+                    clone.stop()
+                    kame.stop()
+                    shield.stop()
+                    web.stop()
+                    heal.stop()
+                    lightning.stop()
+                    ice.stop()
 
-                    # Stop continuous fire when paused.
                     fire_until = 0.0
+                    rasengan.stop()
 
                 else:
 
-                    # Generate monotonic timestamp.
                     timestamp_ms = max(
                         last_timestamp + 1,
                         time.monotonic_ns() // 1_000_000
@@ -540,7 +576,6 @@ class HandAIApp:
 
                     last_timestamp = timestamp_ms
 
-                    # Detect hands.
                     result = tracker.detect(
                         frame,
                         timestamp_ms
@@ -548,16 +583,31 @@ class HandAIApp:
 
                     hands_count = len(result.hand_landmarks)
 
+                    # Detect face on the clean frame, before drawing.
+                    face_data = face_tracker.detect(
+                        frame,
+                        timestamp_ms
+                    )
+
+                    # Palm position for the Rasengan.
+                    if hands_count > 0:
+                        frame_h, frame_w = frame.shape[:2]
+                        pose = two_hand_pose(result, frame_w, frame_h)
+                        index_tip = (
+                            int(result.hand_landmarks[0][8].x * frame_w),
+                            int(result.hand_landmarks[0][8].y * frame_h)
+                        )
+
+                        palm = RasenganEffect.palm_from_landmarks(
+                            result.hand_landmarks[0],
+                            frame_w,
+                            frame_h
+                        )
+
                     # Draw hand landmarks and retrieve gesture.
                     frame, gesture = tracker.draw_landmarks(
                         frame,
                         result
-                    )
-
-                    # Detect face and mouth.
-                    face_data = face_tracker.detect(
-                        frame,
-                        timestamp_ms
                     )
 
                     if face_data is not None:
@@ -583,8 +633,9 @@ class HandAIApp:
                     else:
                         spell_text = "No spell in progress"
 
-                    # Activate FIREBALL.
-                    if spell_state["activated"] == "FIREBALL":
+                    activated = spell_state["activated"]
+
+                    if activated == "FIREBALL":
 
                         fire_until = time.monotonic() + 2.5
 
@@ -600,20 +651,107 @@ class HandAIApp:
 
                         status = "FIREBALL ACTIVATED!"
 
+                    elif activated == "LIGHTNING":
+
+                        lightning.start()
+                        status = "LIGHTNING STRIKE!"
+
+                    elif activated == "ICE BLAST":
+
+                        if palm is not None:
+                            ice.start(
+                                palm[0],
+                                IceBlastEffect.direction_from_landmarks(
+                                    result.hand_landmarks[0]
+                                )
+                            )
+                        status = "ICE BLAST!"
+
+                    elif activated == "SHADOW CLONE":
+
+                        clone.start()
+                        status = "SHADOW CLONE JUTSU!"
+
+                    elif activated == "KAMEHAMEHA":
+
+                        if pose is not None:
+                            kame.fire(pose[0], pose[1])
+                        elif palm is not None:
+                            kame.fire(
+                                palm[0],
+                                IceBlastEffect.direction_from_landmarks(
+                                    result.hand_landmarks[0]
+                                )
+                            )
+                        status = "KAMEHAMEHA!"
+
+                    elif activated == "MANDALA SHIELD":
+
+                        shield.start()
+                        status = "MANDALA SHIELD!"
+
+                    elif activated == "WEB SHOT":
+
+                        if palm is not None:
+                            web.start(
+                                palm[0],
+                                WebShotEffect.direction_from_landmarks(
+                                    result.hand_landmarks[0]
+                                )
+                            )
+                        status = "WEB SHOT!"
+
+                    elif activated == "HEALING AURA":
+
+                        heal.start()
+                        status = "HEALING AURA!"
+
+                    elif activated == "RASENGAN":
+
+                        rasengan.start()
+                        fist_since = None
+                        hand_lost_since = None
+
+                        status = "RASENGAN!"
+
                     else:
 
-                        status = (
-                            f"{gesture} | {spell_text}"
-                        )
+                        status = f"{gesture} | {spell_text}"
 
-                # Determine whether continuous fire is active.
+                    # Rasengan lifetime: dismiss with a held fist,
+                    # or when the hand disappears for 1 second.
+                    if rasengan.active and activated != "RASENGAN":
+
+                        now = time.monotonic()
+
+                        if gesture == "FIST":
+                            if fist_since is None:
+                                fist_since = now
+                            elif now - fist_since > 0.4:
+                                rasengan.stop()
+                                fist_since = None
+                        else:
+                            fist_since = None
+
+                        if hands_count == 0:
+                            if hand_lost_since is None:
+                                hand_lost_since = now
+                            elif now - hand_lost_since > 1.0:
+                                rasengan.stop()
+                                hand_lost_since = None
+                        else:
+                            hand_lost_since = None
+
+                        if rasengan.active:
+                            status = "RASENGAN ACTIVE | hold a fist to dismiss"
+
+                # Continuous fire.
                 fire_active = (
                     not self.pause_event.is_set()
                     and face_data is not None
                     and time.monotonic() < fire_until
                 )
 
-                # Render fire at the mouth position.
                 mouth_position = (
                     face_data["mouth"]
                     if face_data is not None
@@ -627,7 +765,26 @@ class HandAIApp:
                     dt=effect_dt
                 )
 
-                # Display LIVE indicator.
+                # Lightning and ice effects.
+                frame = lightning.render(frame, index_tip, effect_dt)
+                frame = ice.render(frame, effect_dt)
+
+                # More spell effects.
+                frame = clone.render(frame, effect_dt)
+                frame = heal.render(frame, effect_dt)
+                frame = web.render(frame, effect_dt)
+                frame = kame.render(frame, pose, gesture, effect_dt)
+                frame = shield.render(
+                    frame, palm, effect_dt, gesture, hands_count > 0
+                )
+
+                # Rasengan in the palm.
+                frame = rasengan.render(
+                    frame,
+                    palm,
+                    effect_dt
+                )
+
                 cv2.putText(
                     frame,
                     "HandAI | MAGIC MODE",
@@ -638,7 +795,6 @@ class HandAIApp:
                     2
                 )
 
-                # Display spell status.
                 cv2.putText(
                     frame,
                     status[:65],
@@ -649,7 +805,6 @@ class HandAIApp:
                     2
                 )
 
-                # FPS calculation.
                 delta = current_time - previous_time
 
                 if delta > 0:
@@ -662,7 +817,6 @@ class HandAIApp:
 
                 previous_time = current_time
 
-                # Share data with GUI thread.
                 with self.data_lock:
 
                     self.latest_frame = frame.copy()
@@ -688,7 +842,6 @@ class HandAIApp:
 
             if face_tracker is not None:
                 face_tracker.close()
-
     # ======================================================
     # UPDATE GUI
     # ======================================================

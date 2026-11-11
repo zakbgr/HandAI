@@ -1,0 +1,1586 @@
+===== main.py =====
+
+import cv2
+import mediapipe as mp
+import threading
+import time
+import tkinter as tk
+
+from pathlib import Path
+from PIL import Image, ImageTk
+
+from finger_detection import GestureRecognizer
+from spell_engine import SpellSequenceEngine
+from fire_effects import FireParticleEngine
+from face_tracking import FaceTracker
+
+
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
+
+PROJECT_DIR = Path(__file__).resolve().parent
+MODEL_PATH = PROJECT_DIR / "models" / "hand_landmarker.task"
+
+CAMERA_INDEX = 0
+
+FRAME_WIDTH = 960
+FRAME_HEIGHT = 540
+
+MAX_HANDS = 2
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17)
+]
+
+
+# ==========================================================
+# HAND TRACKING ENGINE
+# ==========================================================
+
+class HandTracker:
+
+    def __init__(self):
+
+        if not MODEL_PATH.exists():
+            raise FileNotFoundError(
+                f"AI model not found: {MODEL_PATH}"
+            )
+
+        # Initialize MediaPipe.
+        base_options = mp.tasks.BaseOptions(
+            model_asset_path=str(MODEL_PATH)
+        )
+
+        options = mp.tasks.vision.HandLandmarkerOptions(
+            base_options=base_options,
+            running_mode=mp.tasks.vision.RunningMode.VIDEO,
+            num_hands=MAX_HANDS,
+            min_hand_detection_confidence=0.5,
+            min_hand_presence_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+
+        self.detector = (
+            mp.tasks.vision.HandLandmarker.create_from_options(
+                options
+            )
+        )
+
+        # Initialize our gesture recognition engine.
+        self.gesture_recognizer = GestureRecognizer()
+
+    # ------------------------------------------------------
+    # DETECT HANDS
+    # ------------------------------------------------------
+
+    def detect(self, frame, timestamp_ms):
+
+        rgb_frame = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2RGB
+        )
+
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=rgb_frame
+        )
+
+        result = self.detector.detect_for_video(
+            mp_image,
+            timestamp_ms
+        )
+
+        return result
+
+    # ------------------------------------------------------
+    # DRAW LANDMARKS + RECOGNIZE GESTURES
+    # ------------------------------------------------------
+
+    def draw_landmarks(self, frame, result):
+
+        height, width, _ = frame.shape
+
+        hands = result.hand_landmarks
+
+        current_gesture = "NO HAND"
+
+        for hand_index, landmarks in enumerate(hands):
+
+            # Identify hand orientation.
+            hand_label = "Unknown"
+
+            if (
+                result.handedness
+                and hand_index < len(result.handedness)
+                and result.handedness[hand_index]
+            ):
+
+                hand_label = (
+                    result.handedness[hand_index][0].category_name
+                )
+
+            # Run finger detection and gesture recognition.
+            fingers, gesture = self.gesture_recognizer.update(
+                landmarks,
+                hand_label
+            )
+            if hand_index == 0:
+                current_gesture = gesture
+
+            # --------------------------------------------------
+            # DRAW SKELETON
+            # --------------------------------------------------
+
+            for start, end in HAND_CONNECTIONS:
+
+                p1 = landmarks[start]
+                p2 = landmarks[end]
+
+                x1 = int(p1.x * width)
+                y1 = int(p1.y * height)
+
+                x2 = int(p2.x * width)
+                y2 = int(p2.y * height)
+
+                cv2.line(
+                    frame,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 255, 120),
+                    2
+                )
+
+            # --------------------------------------------------
+            # DRAW LANDMARK POINTS
+            # --------------------------------------------------
+
+            for index, point in enumerate(landmarks):
+
+                x = int(point.x * width)
+                y = int(point.y * height)
+
+                if index in [4, 8, 12, 16, 20]:
+
+                    color = (0, 100, 255)
+                    radius = 7
+
+                else:
+
+                    color = (255, 255, 0)
+                    radius = 4
+
+                cv2.circle(
+                    frame,
+                    (x, y),
+                    radius,
+                    color,
+                    -1
+                )
+
+            # --------------------------------------------------
+            # DISPLAY GESTURE
+            # --------------------------------------------------
+
+            y_offset = 80 + hand_index * 90
+
+            cv2.putText(
+                frame,
+                f"{hand_label}: {gesture}",
+                (20, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 120),
+                2
+            )
+
+            # --------------------------------------------------
+            # DISPLAY FINGER STATES
+            # --------------------------------------------------
+
+            finger_text = " ".join(
+                f"{name[:1].upper()}:"
+                f"{'UP' if value else 'DOWN'}"
+                for name, value in fingers.items()
+            )
+
+            cv2.putText(
+                frame,
+                finger_text,
+                (20, y_offset + 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2
+            )
+
+        return frame , current_gesture
+
+    # ------------------------------------------------------
+    # RELEASE MODEL
+    # ------------------------------------------------------
+
+    def close(self):
+
+        self.detector.close()
+
+
+# ==========================================================
+# DESKTOP APPLICATION
+# ==========================================================
+
+class HandAIApp:
+
+    def __init__(self, root):
+
+        self.root = root
+
+        self.root.title(
+            "HandAI - Gesture Recognition System"
+        )
+
+        self.root.geometry("1100x760")
+        self.root.minsize(850, 650)
+
+        self.root.configure(
+            bg="#101820"
+        )
+
+        # Thread controls.
+        self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
+
+        self.data_lock = threading.Lock()
+
+        self.latest_frame = None
+
+        self.latest_info = {
+            "hands": 0,
+            "fps": 0,
+            "status": "Initializing..."
+        }
+
+        self.error_message = None
+
+        self.photo = None
+
+        # Build GUI.
+        self.setup_interface()
+
+        # Start background camera thread.
+        self.camera_thread = threading.Thread(
+            target=self.camera_loop,
+            daemon=True
+        )
+
+        self.camera_thread.start()
+
+        # Start GUI updates.
+        self.update_interface()
+
+        # Window close event.
+        self.root.protocol(
+            "WM_DELETE_WINDOW",
+            self.close_application
+        )
+
+        # Keyboard shortcuts.
+        self.root.bind(
+            "<KeyPress-p>",
+            self.toggle_pause
+        )
+
+        self.root.bind(
+            "<KeyPress-P>",
+            self.toggle_pause
+        )
+
+        self.root.bind(
+            "<KeyPress-q>",
+            self.close_application
+        )
+
+        self.root.bind(
+            "<KeyPress-Q>",
+            self.close_application
+        )
+
+    # ======================================================
+    # GUI DESIGN
+    # ======================================================
+
+    def setup_interface(self):
+
+        # Title.
+        title = tk.Label(
+            self.root,
+            text="HandAI",
+            font=("Arial", 28, "bold"),
+            fg="#00ff99",
+            bg="#101820"
+        )
+
+        title.pack(pady=(15, 0))
+
+        subtitle = tk.Label(
+            self.root,
+            text="Real-Time AI Hand Tracking & Gesture Recognition",
+            font=("Arial", 11),
+            fg="white",
+            bg="#101820"
+        )
+
+        subtitle.pack(pady=5)
+
+        # Webcam display.
+        self.video_label = tk.Label(
+            self.root,
+            bg="#000000",
+            text="Waiting for camera...",
+            fg="white",
+            font=("Arial", 14)
+        )
+
+        self.video_label.pack(
+            padx=20,
+            pady=15
+        )
+
+        # Statistics.
+        stats_frame = tk.Frame(
+            self.root,
+            bg="#182630"
+        )
+
+        stats_frame.pack(
+            fill="x",
+            padx=30,
+            pady=10
+        )
+
+        self.hands_label = tk.Label(
+            stats_frame,
+            text="Hands detected: 0",
+            font=("Arial", 13, "bold"),
+            fg="#00ff99",
+            bg="#182630"
+        )
+
+        self.hands_label.pack(
+            side="left",
+            expand=True,
+            pady=15
+        )
+
+        self.fps_label = tk.Label(
+            stats_frame,
+            text="FPS: 0",
+            font=("Arial", 13, "bold"),
+            fg="#00ff99",
+            bg="#182630"
+        )
+
+        self.fps_label.pack(
+            side="left",
+            expand=True,
+            pady=15
+        )
+
+        # Status.
+        self.status_label = tk.Label(
+            self.root,
+            text="Initializing AI...",
+            font=("Arial", 11),
+            fg="white",
+            bg="#101820"
+        )
+
+        self.status_label.pack(pady=5)
+
+        # Buttons.
+        buttons_frame = tk.Frame(
+            self.root,
+            bg="#101820"
+        )
+
+        buttons_frame.pack(pady=15)
+
+        self.pause_button = tk.Button(
+            buttons_frame,
+            text="Pause Detection",
+            command=self.toggle_pause,
+            width=18,
+            bg="#167d5a",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            relief="flat"
+        )
+
+        self.pause_button.pack(
+            side="left",
+            padx=10
+        )
+
+        quit_button = tk.Button(
+            buttons_frame,
+            text="Exit",
+            command=self.close_application,
+            width=12,
+            bg="#b83232",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            relief="flat"
+        )
+
+        quit_button.pack(
+            side="left",
+            padx=10
+        )
+
+        # Footer.
+        footer = tk.Label(
+            self.root,
+            text="P = Pause/Resume     Q = Quit",
+            fg="#aaaaaa",
+            bg="#101820",
+            font=("Arial", 9)
+        )
+
+        footer.pack(pady=5)
+
+    # ======================================================
+    # CAMERA + AI PROCESSING
+    # ======================================================
+
+  
+    def camera_loop(self):
+
+        camera = None
+        tracker = None
+        face_tracker = None
+
+        try:
+            # Initialize existing hand tracker.
+            tracker = HandTracker()
+
+            # Initialize face tracking.
+            face_tracker = FaceTracker(
+                str(PROJECT_DIR / "models" / "face_landmarker.task")
+            )
+
+            # Initialize magic engines.
+            spell_engine = SpellSequenceEngine()
+            fire = FireParticleEngine()
+
+            # Initialize webcam.
+            camera = cv2.VideoCapture(
+                CAMERA_INDEX,
+                cv2.CAP_V4L2
+            )
+
+            if not camera.isOpened():
+                raise RuntimeError(
+                    "Cannot open webcam. Check camera permissions."
+                )
+
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+            previous_time = time.perf_counter()
+            effect_previous_time = previous_time
+
+            last_timestamp = 0
+            fps = 0.0
+
+            fire_until = 0.0
+
+            while not self.stop_event.is_set():
+
+                success, frame = camera.read()
+
+                if not success:
+                    time.sleep(0.01)
+                    continue
+
+                # Mirror webcam image.
+                frame = cv2.flip(frame, 1)
+
+                # Calculate effect frame time.
+                current_time = time.perf_counter()
+
+                effect_dt = min(
+                    current_time - effect_previous_time,
+                    0.05
+                )
+
+                effect_previous_time = current_time
+
+                face_data = None
+                gesture = "NO HAND"
+
+                if self.pause_event.is_set():
+
+                    hands_count = 0
+                    status = "Detection paused"
+
+                    # Stop continuous fire when paused.
+                    fire_until = 0.0
+
+                else:
+
+                    # Generate monotonic timestamp.
+                    timestamp_ms = max(
+                        last_timestamp + 1,
+                        time.monotonic_ns() // 1_000_000
+                    )
+
+                    last_timestamp = timestamp_ms
+
+                    # Detect hands.
+                    result = tracker.detect(
+                        frame,
+                        timestamp_ms
+                    )
+
+                    hands_count = len(result.hand_landmarks)
+
+                    # Draw hand landmarks and retrieve gesture.
+                    frame, gesture = tracker.draw_landmarks(
+                        frame,
+                        result
+                    )
+
+                    # Detect face and mouth.
+                    face_data = face_tracker.detect(
+                        frame,
+                        timestamp_ms
+                    )
+
+                    if face_data is not None:
+                        frame = face_tracker.draw_debug(
+                            frame,
+                            face_data
+                        )
+
+                    # Update spell engine.
+                    spell_state = spell_engine.update(
+                        gesture,
+                        now=time.monotonic()
+                    )
+
+                    progress = spell_state["progress"]
+
+                    if progress["spell"] is not None:
+                        spell_text = (
+                            f"{progress['spell']}: "
+                            f"{progress['progress']}/"
+                            f"{progress['total']}"
+                        )
+                    else:
+                        spell_text = "No spell in progress"
+
+                    # Activate FIREBALL.
+                    if spell_state["activated"] == "FIREBALL":
+
+                        fire_until = time.monotonic() + 2.5
+
+                        if face_data is not None:
+
+                            x, y = face_data["mouth"]
+
+                            fire.burst(
+                                x,
+                                y,
+                                count=160
+                            )
+
+                        status = "FIREBALL ACTIVATED!"
+
+                    else:
+
+                        status = (
+                            f"{gesture} | {spell_text}"
+                        )
+
+                # Determine whether continuous fire is active.
+                fire_active = (
+                    not self.pause_event.is_set()
+                    and face_data is not None
+                    and time.monotonic() < fire_until
+                )
+
+                # Render fire at the mouth position.
+                mouth_position = (
+                    face_data["mouth"]
+                    if face_data is not None
+                    else None
+                )
+
+                frame = fire.render(
+                    frame,
+                    origin=mouth_position,
+                    active=fire_active,
+                    dt=effect_dt
+                )
+
+                # Display LIVE indicator.
+                cv2.putText(
+                    frame,
+                    "HandAI | MAGIC MODE",
+                    (20, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 120),
+                    2
+                )
+
+                # Display spell status.
+                cv2.putText(
+                    frame,
+                    status[:65],
+                    (20, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 180, 255),
+                    2
+                )
+
+                # FPS calculation.
+                delta = current_time - previous_time
+
+                if delta > 0:
+                    current_fps = 1.0 / delta
+
+                    fps = (
+                        0.85 * fps
+                        + 0.15 * current_fps
+                    )
+
+                previous_time = current_time
+
+                # Share data with GUI thread.
+                with self.data_lock:
+
+                    self.latest_frame = frame.copy()
+
+                    self.latest_info = {
+                        "hands": hands_count,
+                        "fps": round(fps, 1),
+                        "status": status
+                    }
+
+        except Exception as error:
+
+            with self.data_lock:
+                self.error_message = str(error)
+
+        finally:
+
+            if camera is not None:
+                camera.release()
+
+            if tracker is not None:
+                tracker.close()
+
+            if face_tracker is not None:
+                face_tracker.close()
+
+    # ======================================================
+    # UPDATE GUI
+    # ======================================================
+
+    def update_interface(self):
+
+        with self.data_lock:
+
+            frame = (
+                self.latest_frame.copy()
+                if self.latest_frame is not None
+                else None
+            )
+
+            info = self.latest_info.copy()
+
+            error = self.error_message
+
+        if error:
+
+            self.status_label.config(
+                text=f"ERROR: {error}",
+                fg="#ff5555"
+            )
+
+        if frame is not None:
+
+            # Resize frame.
+            frame = cv2.resize(
+                frame,
+                (960, 540)
+            )
+
+            # Convert BGR to RGB.
+            rgb = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB
+            )
+
+            image = Image.fromarray(rgb)
+
+            self.photo = ImageTk.PhotoImage(
+                image=image
+            )
+
+            self.video_label.configure(
+                image=self.photo,
+                text=""
+            )
+
+            self.hands_label.config(
+                text=f"Hands detected: {info['hands']}"
+            )
+
+            self.fps_label.config(
+                text=f"FPS: {info['fps']}"
+            )
+
+            if not error:
+
+                self.status_label.config(
+                    text=info["status"],
+                    fg="#00ff99"
+                )
+
+        if not self.stop_event.is_set():
+
+            self.root.after(
+                15,
+                self.update_interface
+            )
+
+    # ======================================================
+    # PAUSE / RESUME
+    # ======================================================
+
+    def toggle_pause(self, event=None):
+
+        if self.pause_event.is_set():
+
+            self.pause_event.clear()
+
+            self.pause_button.config(
+                text="Pause Detection",
+                bg="#167d5a"
+            )
+
+        else:
+
+            self.pause_event.set()
+
+            self.pause_button.config(
+                text="Resume Detection",
+                bg="#a36b20"
+            )
+
+    # ======================================================
+    # CLOSE APPLICATION
+    # ======================================================
+
+    def close_application(self, event=None):
+
+        if self.stop_event.is_set():
+            return
+
+        self.stop_event.set()
+
+        self.root.destroy()
+
+
+# ==========================================================
+# APPLICATION ENTRY POINT
+# ==========================================================
+
+if __name__ == "__main__":
+
+    root = tk.Tk()
+
+    app = HandAIApp(root)
+
+    root.mainloop()
+
+===== finger_detection.py =====
+
+from collections import deque
+
+
+class GestureRecognizer:
+
+    def __init__(self, history_size=5):
+
+        self.history_size = history_size
+        self.history = {}
+
+    # --------------------------------------------------
+    # DETECT INDIVIDUAL FINGERS
+    # --------------------------------------------------
+
+    def detect_fingers(self, landmarks, handedness):
+
+        # Thumb: compare horizontal positions.
+        thumb_tip = landmarks[4]
+        thumb_ip = landmarks[3]
+
+        if handedness.lower() == "right":
+            thumb_up = thumb_tip.x < thumb_ip.x - 0.015
+        else:
+            thumb_up = thumb_tip.x > thumb_ip.x + 0.015
+
+        # Other four fingers.
+        finger_pairs = {
+            "index": (8, 6),
+            "middle": (12, 10),
+            "ring": (16, 14),
+            "pinky": (20, 18)
+        }
+
+        states = {
+            "thumb": thumb_up
+        }
+
+        for finger, (tip_id, joint_id) in finger_pairs.items():
+
+            tip = landmarks[tip_id]
+            joint = landmarks[joint_id]
+
+            states[finger] = tip.y < joint.y - 0.015
+
+        return states
+
+    # --------------------------------------------------
+    # SMOOTH FINGER DETECTION
+    # --------------------------------------------------
+
+    def smooth_states(self, hand_id, states):
+
+        if hand_id not in self.history:
+
+            self.history[hand_id] = deque(
+                maxlen=self.history_size
+            )
+
+        history = self.history[hand_id]
+
+        history.append(states.copy())
+
+        smoothed = {}
+
+        for finger in states:
+
+            up_count = sum(
+                1 for frame in history
+                if frame[finger]
+            )
+
+            smoothed[finger] = (
+                up_count > len(history) / 2
+            )
+
+        return smoothed
+
+    # --------------------------------------------------
+    # CLASSIFY GESTURE
+    # --------------------------------------------------
+
+    def classify_gesture(self, fingers):
+
+        thumb = fingers["thumb"]
+        index = fingers["index"]
+        middle = fingers["middle"]
+        ring = fingers["ring"]
+        pinky = fingers["pinky"]
+
+        # All five fingers extended.
+        if all(fingers.values()):
+            return "OPEN PALM"
+
+        # All fingers closed.
+        if not any(fingers.values()):
+            return "FIST"
+
+        # Peace sign.
+        if (
+            not thumb
+            and index
+            and middle
+            and not ring
+            and not pinky
+        ):
+            return "PEACE SIGN"
+
+        # Pointing.
+        if (
+            not thumb
+            and index
+            and not middle
+            and not ring
+            and not pinky
+        ):
+            return "POINTING"
+
+        # Thumbs up.
+        if (
+            thumb
+            and not index
+            and not middle
+            and not ring
+            and not pinky
+        ):
+            return "THUMBS UP"
+
+        # Rock sign.
+        if (
+            not thumb
+            and index
+            and not middle
+            and not ring
+            and pinky
+        ):
+            return "ROCK SIGN"
+
+        return "UNKNOWN GESTURE"
+
+    # --------------------------------------------------
+    # COMPLETE RECOGNITION PIPELINE
+    # --------------------------------------------------
+
+    def update(self, landmarks, handedness):
+
+        raw_states = self.detect_fingers(
+            landmarks,
+            handedness
+        )
+
+        stable_states = self.smooth_states(
+            handedness,
+            raw_states
+        )
+
+        gesture = self.classify_gesture(
+            stable_states
+        )
+
+        return stable_states, gesture
+
+===== spell_engine.py =====
+
+import time
+
+
+class SpellSequenceEngine:
+
+    NEUTRAL_GESTURES = {
+        "UNKNOWN GESTURE",
+        "NO HAND",
+        "",
+    }
+
+    def __init__(
+        self,
+        stable_duration=0.20,
+        sequence_timeout=3.0,
+        cooldown=2.0,
+    ):
+        self.stable_duration = stable_duration
+        self.sequence_timeout = sequence_timeout
+        self.cooldown = cooldown
+
+        self.spells = {
+            "FIREBALL": {
+                "sequence": ["FIST", "FIST", "ROCK SIGN"],
+                "effect": "FIRE",
+                "description": "Unleash a fireball!",
+            },
+            "LIGHTNING": {
+                "sequence": ["OPEN PALM", "FIST", "POINTING"],
+                "effect": "LIGHTNING",
+                "description": "Summon lightning!",
+            },
+            "ICE BLAST": {
+                "sequence": ["THUMBS UP", "FIST", "OPEN PALM"],
+                "effect": "ICE",
+                "description": "Unleash an ice blast!",
+            },
+        }
+
+        self.progress = {
+            name: 0 for name in self.spells
+        }
+
+        self.candidate = None
+        self.candidate_since = None
+        self.last_emitted = None
+
+        self.last_event_time = None
+        self.cooldown_until = 0.0
+        self.last_activated = None
+
+    def reset_sequence(self):
+        self.progress = {
+            name: 0 for name in self.spells
+        }
+        self.last_event_time = None
+
+    def get_progress(self):
+
+        best = {
+            "spell": None,
+            "progress": 0,
+            "total": 0,
+        }
+
+        for name, spell in self.spells.items():
+
+            current = self.progress[name]
+
+            if current > best["progress"]:
+                best = {
+                    "spell": name,
+                    "progress": current,
+                    "total": len(spell["sequence"]),
+                }
+
+        return best
+
+    def update(self, gesture, now=None):
+
+        if now is None:
+            now = time.monotonic()
+
+        gesture = (gesture or "").upper().strip()
+
+        activated = None
+        event = False
+
+        # Sequence expiration.
+        if (
+            self.last_event_time is not None
+            and now - self.last_event_time > self.sequence_timeout
+        ):
+            self.reset_sequence()
+
+        # Stable gesture detection.
+        if gesture != self.candidate:
+            self.candidate = gesture
+            self.candidate_since = now
+
+        stable = (
+            self.candidate_since is not None
+            and now - self.candidate_since >= self.stable_duration
+        )
+
+        if stable:
+
+            if gesture in self.NEUTRAL_GESTURES:
+                self.last_emitted = None
+
+            elif gesture != self.last_emitted:
+
+                self.last_emitted = gesture
+                event = True
+
+                if now >= self.cooldown_until:
+
+                    self.last_event_time = now
+
+                    for name, spell in self.spells.items():
+
+                        sequence = spell["sequence"]
+                        position = self.progress[name]
+
+                        if position < len(sequence):
+
+                            if gesture == sequence[position]:
+                                self.progress[name] += 1
+
+                            elif gesture == sequence[0]:
+                                self.progress[name] = 1
+
+                    for name, spell in self.spells.items():
+
+                        if self.progress[name] == len(spell["sequence"]):
+
+                            activated = name
+                            self.last_activated = name
+
+                            self.cooldown_until = now + self.cooldown
+
+                            self.reset_sequence()
+                            break
+
+        remaining = max(
+            0.0,
+            self.cooldown_until - now,
+        )
+
+        return {
+            "gesture": gesture,
+            "event": event,
+            "activated": activated,
+            "progress": self.get_progress(),
+            "cooldown": round(remaining, 2),
+            "ready": remaining <= 0,
+        }
+
+    def get_spellbook(self):
+
+        return {
+            name: {
+                "sequence": spell["sequence"].copy(),
+                "effect": spell["effect"],
+                "description": spell["description"],
+            }
+            for name, spell in self.spells.items()
+        }
+
+===== fire_effects.py =====
+
+import cv2
+import math
+import random
+import time
+
+
+class FireParticle:
+    def __init__(
+        self,
+        x,
+        y,
+        vx,
+        vy,
+        lifetime,
+        radius,
+    ):
+        self.x = float(x)
+        self.y = float(y)
+
+        self.vx = float(vx)
+        self.vy = float(vy)
+
+        self.lifetime = lifetime
+        self.age = 0.0
+
+        self.radius = radius
+
+    @property
+    def alive(self):
+        return self.age < self.lifetime
+
+
+class FireParticleEngine:
+
+    def __init__(self):
+
+        self.particles = []
+
+        self.max_particles = 900
+
+        self.gravity = -35.0
+
+        self.enabled = True
+
+        self.last_update = None
+
+    def clear(self):
+        self.particles.clear()
+
+    # --------------------------------------------------
+    # CREATE PARTICLES
+    # --------------------------------------------------
+
+    def spawn_flame(self, x, y, count=8):
+
+        if not self.enabled:
+            return
+
+        available = self.max_particles - len(self.particles)
+
+        for _ in range(min(count, available)):
+
+            self.particles.append(
+                FireParticle(
+                    x=x + random.uniform(-12, 12),
+                    y=y + random.uniform(-5, 5),
+
+                    vx=random.uniform(-65, 65),
+                    vy=random.uniform(-240, -100),
+
+                    lifetime=random.uniform(0.35, 0.85),
+                    radius=random.uniform(5, 15),
+                )
+            )
+
+    # --------------------------------------------------
+    # FIREBALL BURST
+    # --------------------------------------------------
+
+    def burst(
+        self,
+        x,
+        y,
+        count=100,
+        direction=(0.0, -1.0),
+    ):
+
+        if not self.enabled:
+            return
+
+        dx, dy = direction
+
+        length = math.hypot(dx, dy)
+
+        if length == 0:
+            dx, dy = 0.0, -1.0
+            length = 1.0
+
+        dx /= length
+        dy /= length
+
+        available = self.max_particles - len(self.particles)
+
+        for _ in range(min(count, available)):
+
+            angle = random.uniform(-0.8, 0.8)
+
+            speed = random.uniform(100, 450)
+
+            # Rotate the direction slightly.
+            vx = dx * math.cos(angle) - dy * math.sin(angle)
+            vy = dx * math.sin(angle) + dy * math.cos(angle)
+
+            self.particles.append(
+                FireParticle(
+                    x=x + random.uniform(-8, 8),
+                    y=y + random.uniform(-8, 8),
+
+                    vx=vx * speed,
+                    vy=vy * speed,
+
+                    lifetime=random.uniform(0.35, 1.0),
+                    radius=random.uniform(4, 13),
+                )
+            )
+
+    # --------------------------------------------------
+    # PARTICLE COLORS
+    # --------------------------------------------------
+
+    @staticmethod
+    def get_color(progress):
+
+        # OpenCV uses BGR, not RGB.
+
+        if progress < 0.25:
+            return (0, 220, 255)       # Yellow
+
+        if progress < 0.55:
+            return (0, 100, 255)       # Orange
+
+        if progress < 0.80:
+            return (0, 45, 220)        # Deep orange
+
+        return (30, 30, 130)           # Dark red
+
+    # --------------------------------------------------
+    # UPDATE PARTICLES
+    # --------------------------------------------------
+
+    def update(self, dt):
+
+        dt = max(0.0, min(dt, 0.05))
+
+        for particle in self.particles:
+
+            particle.age += dt
+
+            particle.vy += self.gravity * dt
+
+            particle.x += particle.vx * dt
+            particle.y += particle.vy * dt
+
+            # Small random flame movement.
+            particle.vx += random.uniform(-20, 20) * dt
+
+        self.particles = [
+            particle
+            for particle in self.particles
+            if particle.alive
+        ]
+
+    # --------------------------------------------------
+    # RENDER FIRE
+    # --------------------------------------------------
+
+    def draw(self, frame):
+
+        height, width = frame.shape[:2]
+
+        glow = frame.copy()
+        glow[:] = 0
+        core = frame.copy()
+        core[:] = 0 
+
+        for particle in self.particles:
+
+            if not particle.alive:
+                continue
+
+            progress = particle.age / particle.lifetime
+
+            fade = 1.0 - progress
+
+            radius = max(
+                1,
+                int(particle.radius * fade)
+            )
+
+            x = int(particle.x)
+            y = int(particle.y)
+
+            if not (0 <= x < width and 0 <= y < height):
+                continue
+
+            color = self.get_color(progress)
+
+            # Outer glow.
+            cv2.circle(
+                glow,
+                (x, y),
+                radius * 3,
+                color,
+                -1,
+                cv2.LINE_AA,
+            )
+
+            # Bright flame core.
+            cv2.circle(
+                core,
+                (x, y),
+                radius,
+                (0, 180, 255),
+                -1,
+                cv2.LINE_AA,
+            )
+
+        # Blur glow layer.
+        glow = cv2.GaussianBlur(
+            glow,
+            (21, 21),
+            0,
+        )
+
+        # Composite the glow.
+        result = cv2.addWeighted(
+            frame, 1.0,
+            glow, 0.65,
+            0
+        )
+
+        result = cv2.addWeighted(
+            result, 1.0,
+            core, 0.75,
+            0
+        )
+
+        return result
+
+    # --------------------------------------------------
+    # MAIN EFFECT UPDATE
+    # --------------------------------------------------
+
+    def render(
+        self,
+        frame,
+        origin=None,
+        active=False,
+        dt=None,
+    ):
+
+        now = time.perf_counter()
+
+        if dt is None:
+
+            if self.last_update is None:
+                dt = 1 / 30
+            else:
+                dt = now - self.last_update
+
+        self.last_update = now
+
+        dt = max(0.0, min(dt, 0.05))
+
+        if active and origin is not None:
+
+            x, y = origin
+
+            self.spawn_flame(
+                x,
+                y,
+                count=8,
+            )
+
+        self.update(dt)
+
+        return self.draw(frame)
+
+===== face_tracking.py =====
+import cv2
+import mediapipe as mp
+
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+
+class FaceTracker:
+    # MediaPipe Face Mesh landmarks:
+    # 13 = upper inner lip
+    # 14 = lower inner lip
+    # 1  = nose area
+    UPPER_LIP = 13
+    LOWER_LIP = 14
+    NOSE = 1
+
+    def __init__(self, model_path="models/face_landmarker.task"):
+        base_options = python.BaseOptions(
+            model_asset_path=model_path
+        )
+
+        options = vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+            output_face_blendshapes=False,
+        )
+
+        self.landmarker = vision.FaceLandmarker.create_from_options(
+            options
+        )
+
+        self.last_timestamp_ms = -1
+
+    def detect(self, frame, timestamp_ms):
+        """
+        Returns:
+            {
+                "mouth": (x, y),
+                "nose": (x, y),
+                "landmarks": face_landmarks
+            }
+
+        Returns None when no face is detected.
+        """
+
+        if timestamp_ms <= self.last_timestamp_ms:
+            timestamp_ms = self.last_timestamp_ms + 1
+
+        self.last_timestamp_ms = timestamp_ms
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=rgb
+        )
+
+        result = self.landmarker.detect_for_video(
+            mp_image,
+            timestamp_ms
+        )
+
+        if not result.face_landmarks:
+            return None
+
+        landmarks = result.face_landmarks[0]
+
+        height, width = frame.shape[:2]
+
+        upper = landmarks[self.UPPER_LIP]
+        lower = landmarks[self.LOWER_LIP]
+        nose = landmarks[self.NOSE]
+
+        mouth_x = int(((upper.x + lower.x) / 2) * width)
+        mouth_y = int(((upper.y + lower.y) / 2) * height)
+
+        nose_x = int(nose.x * width)
+        nose_y = int(nose.y * height)
+
+        return {
+            "mouth": (mouth_x, mouth_y),
+            "nose": (nose_x, nose_y),
+            "landmarks": landmarks,
+        }
+
+    def draw_debug(self, frame, face_data):
+        if face_data is None:
+            cv2.putText(
+                frame,
+                "FACE NOT DETECTED",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255),
+                2
+            )
+            return frame
+
+        mouth_x, mouth_y = face_data["mouth"]
+        nose_x, nose_y = face_data["nose"]
+
+        # Mouth marker
+        cv2.circle(
+            frame,
+            (mouth_x, mouth_y),
+            8,
+            (0, 0, 255),
+            -1
+        )
+
+        # Nose marker
+        cv2.circle(
+            frame,
+            (nose_x, nose_y),
+            5,
+            (255, 255, 0),
+            -1
+        )
+
+        # Line connecting nose to mouth
+        cv2.line(
+            frame,
+            (nose_x, nose_y),
+            (mouth_x, mouth_y),
+            (0, 255, 0),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            "DRAGON BREATH ORIGIN",
+            (mouth_x + 12, mouth_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 100, 255),
+            2
+        )
+
+        return frame
+
+    def close(self):
+        self.landmarker.close()
+

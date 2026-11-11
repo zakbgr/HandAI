@@ -136,6 +136,66 @@ class GestureRecognizer:
         ):
             return "ROCK SIGN"
 
+        # Three fingers.
+        if (
+            not thumb
+            and index
+            and middle
+            and ring
+            and not pinky
+        ):
+            return "THREE FINGERS"
+
+        # Four fingers.
+        if (
+            not thumb
+            and index
+            and middle
+            and ring
+            and pinky
+        ):
+            return "FOUR FINGERS"
+
+        # Shaka.
+        if (
+            thumb
+            and not index
+            and not middle
+            and not ring
+            and pinky
+        ):
+            return "SHAKA"
+
+        # Love sign.
+        if (
+            thumb
+            and index
+            and not middle
+            and not ring
+            and pinky
+        ):
+            return "LOVE SIGN"
+
+        # Gun sign.
+        if (
+            thumb
+            and index
+            and not middle
+            and not ring
+            and not pinky
+        ):
+            return "GUN SIGN"
+
+        # Pinky up.
+        if (
+            not thumb
+            and not index
+            and not middle
+            and not ring
+            and pinky
+        ):
+            return "PINKY UP"
+
         return "UNKNOWN GESTURE"
 
     # --------------------------------------------------
